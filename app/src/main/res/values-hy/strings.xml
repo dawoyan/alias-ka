@@ -23,7 +23,7 @@
  <string name="move_down">Տեղափոխել ներքև</string>
  <string name="team_name_required">Թիմի անունը պարտադիր է</string>
  <string name="duplicate_team">Այդ թիմի անունն արդեն կա</string>
- <string name="need_two_teams">Խաղը սկսելու համար պետք է առնվազն երկու թիմ</string>
+ <string name="need_two_teams">Խաղը սկսելու համար պետք է առնվազն երկու թիմ</string><string name="syncing_words">Բառերը համաժամեցվում են…</string>
  <string name="searching">Որոնվում են մոտակա Alias-ka խաղերը…</string>
  <string name="found_game">Խաղ է գտնվել</string>
  <string name="join">Միանալ</string>

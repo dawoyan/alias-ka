@@ -1,6 +1,6 @@
 package com.davoyans.alias_ka.domain
 
-enum class WordSetSource { BUNDLED, IMPORTED }
+enum class WordSetSource { BUNDLED, IMPORTED, SUPABASE }
 data class AliasWord(val text: String, val hint: String? = null)
 data class WordSet(val id: String, val name: String, val words: List<AliasWord>, val source: WordSetSource, val createdAtMillis:Long=0, val updatedAtMillis:Long=0)
 data class CsvImportResult(val wordSet:WordSet?,val importedCount:Int,val duplicateCount:Int,val emptyCount:Int,val error:String?=null)

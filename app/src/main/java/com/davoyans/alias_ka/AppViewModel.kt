@@ -3,15 +3,18 @@ package com.davoyans.alias_ka
 import android.app.Application
 import androidx.compose.runtime.*
 import androidx.lifecycle.AndroidViewModel
+import androidx.lifecycle.viewModelScope
 import com.davoyans.alias_ka.domain.*
 import com.davoyans.alias_ka.nearby.*
-import com.davoyans.alias_ka.data.PersistentWordSetRepository
+import com.davoyans.alias_ka.data.SharedPrefsWordQueueStore
+import com.davoyans.alias_ka.data.SupabaseSyncRepository
 import android.util.Base64
 import android.content.pm.PackageManager
 import android.os.Build
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import kotlinx.coroutines.launch
 
 enum class Screen { HOME, CREATE, LOBBY, JOIN, ROUND, REVIEW, SCOREBOARD, SETTINGS, ABOUT, GAME_OVER, DIAGNOSTICS }
 enum class WordTransferStatus { IDLE, RECEIVING, COMPLETE, FAILED }
@@ -20,8 +23,9 @@ enum class ClientMode { IDLE, JOINING, CONNECTED, DISCONNECTED, HOST }
 enum class ClientEvent { GAME_ENDED, CONNECTION_LOST }
 
 class AppViewModel(app:Application):AndroidViewModel(app),NearbyConnectionsGameTransport.Listener {
- private val wordSetRepository=PersistentWordSetRepository(app)
- private val engine=GameEngine(wordSetRepository)
+ private val store=SharedPrefsWordQueueStore(app)
+ private val syncRepo=SupabaseSyncRepository(store=store,scope=viewModelScope,onLog=::log)
+ private val engine=GameEngine(syncRepo)
  private val prefs=app.getSharedPreferences("alias-ka",0)
  val transport=NearbyConnectionsGameTransport(app,this)
  private val logFmt=SimpleDateFormat("HH:mm:ss.SSS", Locale.US)
@@ -53,6 +57,8 @@ class AppViewModel(app:Application):AndroidViewModel(app),NearbyConnectionsGameT
 
  var hintWordId by mutableStateOf<String?>(null)
  var hintText by mutableStateOf<String?>(null)
+ var isSyncing by mutableStateOf(false)
+ val syncQueueSize:Int get()=syncRepo.queueSize
 
  val suggestions=listOf("Alias-ka Party","Կինոյի երեկո","Խոսող ծիրան","Ուրախ կեֆ")
  init{log("INFO APP_STARTED version=${BuildConfig.VERSION_NAME}")}
@@ -61,9 +67,6 @@ class AppViewModel(app:Application):AndroidViewModel(app),NearbyConnectionsGameT
  var targetScore by mutableIntStateOf(prefs.getInt("targetScore",50))
  val lastGame get()=prefs.getString("lastGame",null)
  val lastTeam get()=prefs.getString("lastTeam",null)
- var wordSets by mutableStateOf(wordSetRepository.all())
- var activeWordSetId by mutableStateOf(wordSetRepository.active().id)
- var importResult by mutableStateOf<CsvImportResult?>(null)
 
  val clientMode: ClientMode get() = when {
   isHost -> ClientMode.HOST
@@ -73,10 +76,6 @@ class AppViewModel(app:Application):AndroidViewModel(app),NearbyConnectionsGameT
   else -> ClientMode.IDLE
  }
 
- fun importCsv(name:String,csv:String){importResult=wordSetRepository.import(name,csv);wordSets=wordSetRepository.all();importResult?.wordSet?.let{selectWordSet(it.id)};log(if(importResult?.error==null)"INFO WORDSET_IMPORTED ${importResult?.importedCount}" else "ERROR WORDSET_IMPORT ${importResult?.error}")}
- fun selectWordSet(id:String){wordSetRepository.select(id);activeWordSetId=id;log("INFO WORDSET_SELECTED $id")}
- fun renameWordSet(id:String,name:String){wordSetRepository.rename(id,name);wordSets=wordSetRepository.all()}
- fun deleteWordSet(id:String){wordSetRepository.delete(id);wordSets=wordSetRepository.all();activeWordSetId=wordSetRepository.active().id}
  fun updateRoundSeconds(v:Int){roundSeconds=v.coerceIn(15,180);prefs.edit().putInt("roundSeconds",roundSeconds).apply()}
  fun updateTargetScore(v:Int){targetScore=v.coerceIn(5,200);prefs.edit().putInt("targetScore",targetScore).apply()}
  fun clearLogs(){logs=emptyList();log("INFO LOGS_CLEARED userAction=true")}
@@ -102,11 +101,38 @@ class AppViewModel(app:Application):AndroidViewModel(app),NearbyConnectionsGameT
  }
  fun retryWordTransfer(){transferStatus=WordTransferStatus.RECEIVING;transport.sendEvent(GameEvent("WORD_COLLECTION_RETRY",clientTeamName.trim()));log("INFO WORD_TRANSFER_RETRY")}
  fun permissionDenied(operation:String){val detail="Runtime permission denied for $operation";lastTechnicalError=detail;error=detail;log("ERROR $detail")}
- fun start(){val s=session?:return;if(s.teams.size<2){error="Add at least two teams to start";return};session=engine.startRound(s,System.currentTimeMillis());screen=Screen.ROUND;broadcast();log("INFO ROUND_STARTED session=${s.id}")}
- fun correct(){if(isHost){session=session?.let(engine::correct);broadcast()}else transport.sendEvent(GameEvent("WORD_MARKED_CORRECT"));log("INFO WORD_MARKED_CORRECT")}
- fun skip(){if(isHost){session=session?.let(engine::skip);broadcast()}else transport.sendEvent(GameEvent("WORD_SKIPPED"));log("INFO WORD_SKIPPED")}
+
+ fun start(){
+  val s=session?:return
+  if(s.teams.size<2){error="Add at least two teams to start";return}
+  if(isSyncing)return
+  viewModelScope.launch{
+   isSyncing=true
+   syncRepo.ensureWordsAvailableForGame()
+   isSyncing=false
+   session=engine.startRound(s,System.currentTimeMillis())
+   trackActiveWord()
+   screen=Screen.ROUND
+   broadcast()
+   log("INFO ROUND_STARTED session=${s.id}")
+  }
+ }
+
+ fun correct(){
+  if(isHost){session=session?.let(engine::correct);trackActiveWord();broadcast()}
+  else transport.sendEvent(GameEvent("WORD_MARKED_CORRECT"))
+  log("INFO WORD_MARKED_CORRECT")
+ }
+
+ fun skip(){
+  if(isHost){session=session?.let(engine::skip);trackActiveWord();broadcast()}
+  else transport.sendEvent(GameEvent("WORD_SKIPPED"))
+  log("INFO WORD_SKIPPED")
+ }
+
  fun selectSkipped(id:String){if(isHost){session=session?.let{engine.selectSkipped(it,id)};broadcast()}else transport.sendEvent(GameEvent("SKIPPED_WORD_SELECTED",id))}
  fun guessedSkipped(){if(isHost){session=session?.let(engine::guessedSkipped);broadcast()}else transport.sendEvent(GameEvent("SKIPPED_WORD_GUESSED"))}
+
  fun protest(wordId:String){
   val s=session?:return
   val byTeamId=ownTeamId?:s.teams.getOrNull((s.currentTeamIndex+1)%s.teams.size)?.id?:return
@@ -122,7 +148,20 @@ class AppViewModel(app:Application):AndroidViewModel(app),NearbyConnectionsGameT
  fun dismissHint(){hintWordId=null;hintText=null}
  fun endRound(){session=session?.let(engine::endRound);screen=Screen.REVIEW;broadcast()}
  fun next(){session=session?.let(engine::next);screen=if(session?.state==GameState.GAME_OVER)Screen.GAME_OVER else Screen.SCOREBOARD;broadcast()}
- fun beginNext(){session=session?.let{engine.startRound(it,System.currentTimeMillis())};screen=Screen.ROUND;broadcast()}
+
+ fun beginNext(){
+  if(isSyncing)return
+  viewModelScope.launch{
+   isSyncing=true
+   syncRepo.ensureWordsAvailableForGame()
+   isSyncing=false
+   session=session?.let{engine.startRound(it,System.currentTimeMillis())}
+   trackActiveWord()
+   screen=Screen.ROUND
+   broadcast()
+  }
+ }
+
  fun resetSame(){session=session?.copy(teams=session!!.teams.map{it.copy(score=0,roundsPlayed=0)},state=GameState.LOBBY,currentTeamIndex=0,currentRound=null,finishing=false,winnerTeamId=null,protestState=null);screen=Screen.LOBBY}
  fun home(){
   if(isHost&&session!=null){transport.sendEvent(GameEvent("SESSION_ENDED",session!!.id));log("INFO SESSION_ENDED id=${session!!.id}")}
@@ -138,6 +177,14 @@ class AppViewModel(app:Application):AndroidViewModel(app),NearbyConnectionsGameT
   transferChecksum="";transferCompleteSignal=false;discovered=emptyList();isDiscovering=false
   log("INFO CLIENT_STATE_RESET")
  }
+ private fun trackActiveWord(){
+  if(!isHost)return
+  val round=session?.currentRound?:return
+  if(round.phase!=RoundPhase.NORMAL_PASS)return
+  val active=round.words.firstOrNull{it.isActive}?:return
+  syncRepo.markWordDisplayed(active.text)
+  syncRepo.prefetchIfLow()
+ }
  private fun mutate(block:(AliasGameSession)->AliasGameSession){val s=session?:return;runCatching{block(s)}.onSuccess{session=it;broadcast()}.onFailure{error=it.message}}
  private fun broadcast(){session?.let{transport.sendSnapshot(GameSnapshot(SessionCodec.encode(it)))}}
  override fun onAdvertisingStarted(){sharing=true;log("INFO ADVERTISING_STARTED")}
@@ -151,7 +198,6 @@ class AppViewModel(app:Application):AndroidViewModel(app),NearbyConnectionsGameT
  override fun onDisconnected(endpointId:String){
   log("WARN CLIENT_DISCONNECTED endpoint=$endpointId")
   if(!isHost&&activeSessionId!=null){
-   // Host disappeared without clean SESSION_ENDED
    clientEvent=ClientEvent.CONNECTION_LOST
    clearAllState()
    transport.stopDiscovery()
@@ -180,8 +226,8 @@ class AppViewModel(app:Application):AndroidViewModel(app),NearbyConnectionsGameT
     screen=Screen.HOME
    }
   }
-  message=="EVENT|WORD_MARKED_CORRECT|"&&isHost->{session=session?.let(engine::correct);broadcast()}
-  message=="EVENT|WORD_SKIPPED|"&&isHost->{session=session?.let(engine::skip);broadcast()}
+  message=="EVENT|WORD_MARKED_CORRECT|"&&isHost->{session=session?.let(engine::correct);trackActiveWord();broadcast()}
+  message=="EVENT|WORD_SKIPPED|"&&isHost->{session=session?.let(engine::skip);trackActiveWord();broadcast()}
   message.startsWith("EVENT|SKIPPED_WORD_SELECTED|")&&isHost->{val id=message.substringAfterLast('|');session=session?.let{engine.selectSkipped(it,id)};broadcast()}
   message=="EVENT|SKIPPED_WORD_GUESSED|"&&isHost->{session=session?.let(engine::guessedSkipped);broadcast()}
   message.startsWith("EVENT|WORD_PROTESTED|")&&isHost->{
@@ -233,7 +279,7 @@ class AppViewModel(app:Application):AndroidViewModel(app),NearbyConnectionsGameT
   return !canCorrect()
  }
  fun isActiveTeamPhone():Boolean {val s=session?:return false;return engine.isActiveTeamController(s,ownTeamId,isHost)}
- private fun sendWordCollection(endpointId:String){val set=wordSetRepository.active();val texts=set.words.map{it.text};val chunks=texts.chunked(40);val checksum=wordChecksum(texts);log("INFO WORD_TRANSFER_STARTED endpoint=$endpointId count=${texts.size}");transport.sendEventTo(endpointId,GameEvent("WORD_COLLECTION_METADATA","${set.id}|${texts.size}|${chunks.size}|$checksum"));chunks.forEachIndexed{i,chunk->val data=Base64.encodeToString(chunk.joinToString("\n").toByteArray(),Base64.NO_WRAP);transport.sendEventTo(endpointId,GameEvent("WORD_COLLECTION_CHUNK","$i|${chunks.size}|$data"))};transport.sendEventTo(endpointId,GameEvent("WORD_COLLECTION_TRANSFER_COMPLETE",checksum));log("INFO WORD_TRANSFER_COMPLETED endpoint=$endpointId")}
+ private fun sendWordCollection(endpointId:String){val set=syncRepo.active();val texts=set.words.map{it.text};val chunks=texts.chunked(40);val checksum=wordChecksum(texts);log("INFO WORD_TRANSFER_STARTED endpoint=$endpointId count=${texts.size}");transport.sendEventTo(endpointId,GameEvent("WORD_COLLECTION_METADATA","${set.id}|${texts.size}|${chunks.size}|$checksum"));chunks.forEachIndexed{i,chunk->val data=Base64.encodeToString(chunk.joinToString("\n").toByteArray(),Base64.NO_WRAP);transport.sendEventTo(endpointId,GameEvent("WORD_COLLECTION_CHUNK","$i|${chunks.size}|$data"))};transport.sendEventTo(endpointId,GameEvent("WORD_COLLECTION_TRANSFER_COMPLETE",checksum));log("INFO WORD_TRANSFER_COMPLETED endpoint=$endpointId")}
  private fun tryFinishTransfer(){if(!transferCompleteSignal||transferChunks.size!=transferExpectedChunks)return;val words=(0 until transferExpectedChunks).flatMap{transferChunks[it].orEmpty()};if(words.size==transferTotal&&wordChecksum(words)==transferChecksum){receivedHostWords=words;transferStatus=WordTransferStatus.COMPLETE;log("INFO WORD_TRANSFER_COMPLETE count=${words.size}");session?.let{routeClientSnapshot(it)}}else{transferStatus=WordTransferStatus.FAILED;onError("Word transfer checksum/count mismatch expected=$transferTotal actual=${words.size}")}}
  private fun routeClientSnapshot(s:AliasGameSession){
   screen=when(s.state){
@@ -246,5 +292,5 @@ class AppViewModel(app:Application):AndroidViewModel(app),NearbyConnectionsGameT
   log("INFO CLIENT_ROUTED ${screen.name} session=${s.id} state=${s.state.name}")
  }
  private fun hasNearbyPermissions(operation:NearbyOperation):Boolean {val app=getApplication<Application>();return NearbyPermissionPolicy.requiredRuntime(Build.VERSION.SDK_INT,operation==NearbyOperation.SHARE).all{app.checkSelfPermission(it)==PackageManager.PERMISSION_GRANTED}}
- private fun startSharing(){val s=session?:return;if(wordSetRepository.active().words.isEmpty()){onError("Active word collection is empty");return};log("INFO SHARE_GAME_TAPPED room=${s.gameName}");transport.startAdvertising(HostRoom("Alias-ka - ${s.gameName}"))}
+ private fun startSharing(){val s=session?:return;if(syncRepo.active().words.isEmpty()){onError("Active word collection is empty");return};log("INFO SHARE_GAME_TAPPED room=${s.gameName}");transport.startAdvertising(HostRoom("Alias-ka - ${s.gameName}"))}
 }
