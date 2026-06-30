@@ -16,7 +16,7 @@ fun interface WordFetcher {
 object SupabaseClient : WordFetcher {
     override suspend fun fetchWords(lastWord: String?, count: Int): List<AliasKaWord> =
         withContext(Dispatchers.IO) {
-            val conn = URL("${BuildConfig.SUPABASE_URL}/functions/v1/alias-ka-next-words")
+            val conn = URL("${BuildConfig.SUPABASE_URL}/api/alias-ka/next-words")
                 .openConnection() as HttpURLConnection
             conn.requestMethod = "POST"
             conn.setRequestProperty("Content-Type", "application/json")
